@@ -1,8 +1,0 @@
-install.packages(c("renv", "rsconnect"))   # si no los tienes
-
-renv::init()          # detecta las dependencias de app.R y crea renv.lock
-renv::snapshot()      # confirma que el lockfile está al día
-
-# rsconnect DEBE correr dentro del entorno renv ya activo, para que el
-# manifest refleje las versiones del renv.lock y no las de tu librería global:
-rsconnect::writeManifest()   # crea manifest.json
