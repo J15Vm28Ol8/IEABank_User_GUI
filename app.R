@@ -70,7 +70,7 @@ scheme_button <- function(rid) {
 # UI
 # ------------------------------------------------------------
 ui <- fluidPage(
-  titlePanel("Banco de ítems — explorador de solo-lectura"),
+  titlePanel("Item Bank — Viewer"),
   sidebarLayout(
     sidebarPanel(
       width = 3,
