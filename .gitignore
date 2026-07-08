@@ -6,7 +6,10 @@
 
 renv/library/
 renv/staging/
+www
 
 *.sqlite
 *.rds
 *.RDS
+
+app_old.R
