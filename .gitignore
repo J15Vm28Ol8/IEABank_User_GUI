@@ -6,7 +6,6 @@
 
 renv/library/
 renv/staging/
-www
 
 *.sqlite
 *.rds
