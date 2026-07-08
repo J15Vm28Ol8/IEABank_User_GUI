@@ -1900,14 +1900,23 @@
     }
   },
   "files": {
+    ".Renviron": {
+      "checksum": "8897c026385ab0089513047da307b652"
+    },
     ".Rprofile": {
-      "checksum": "ca3bd4fac8e487093955af3fec4dcbaf"
+      "checksum": "be828ee516efb34f5ffb9a7709180beb"
     },
     "app.R": {
+      "checksum": "5dbcd6101c6fcc1c96c19506927c084b"
+    },
+    "app_old.R": {
       "checksum": "aeab69dc08733d210b6c18fabc04a111"
     },
     "renv.lock": {
       "checksum": "21149313635619d7d3e8b5ba6f3c7802"
+    },
+    "www/iea_logo.png": {
+      "checksum": "89fb89be975b9b8a9601da6cdab8400e"
     }
   },
   "users": null
