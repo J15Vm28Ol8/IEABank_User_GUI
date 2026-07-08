@@ -2,7 +2,8 @@
 # app.R — IEA Item Bank Explorer
 # ------------------------------------------------------------
 # Public read-only visualizer for questionnaire items, scales,
-# questionnaires, item selection cart, and Excel export.
+# questionnaires, item selection cart, longitudinal detail modals,
+# and Excel export.
 # ============================================================
 
 # ------------------------------------------------------------
@@ -32,7 +33,7 @@ iea_blue <- "#0070b8"
 iea_red  <- "#e2211c"
 
 # ------------------------------------------------------------
-# Conexión (pool: conexiones reutilizables, una sola vez por proceso)
+# Conexión
 # ------------------------------------------------------------
 pool <- dbPool(
   RPostgres::Postgres(),
@@ -89,11 +90,159 @@ filter_by_selected_items <- function(df, selected_item_uids) {
     filter(item_uid %in% selected_item_uids)
 }
 
+show_added_notification <- function(n_items) {
+  showNotification(
+    paste(n_items, "item(s) added to the cart."),
+    type = "message",
+    duration = 2
+  )
+}
+
+sort_years_desc <- function(x) {
+  years <- unique(safe_chr(x))
+  years <- years[years != ""]
+  
+  if (length(years) == 0) {
+    return(character())
+  }
+  
+  years_num <- suppressWarnings(as.numeric(years))
+  
+  if (all(!is.na(years_num))) {
+    years[order(years_num, decreasing = TRUE)]
+  } else {
+    sort(years, decreasing = TRUE)
+  }
+}
+
+datatable_all_items <- function(df, selection = "multiple") {
+  datatable(
+    df,
+    rownames = FALSE,
+    selection = selection,
+    options = list(
+      paging = FALSE,
+      dom = "t",
+      scrollX = TRUE,
+      scrollY = "420px",
+      ordering = TRUE
+    )
+  )
+}
+
+datatable_simple <- function(df, selection = "none") {
+  datatable(
+    df,
+    rownames = FALSE,
+    selection = selection,
+    options = list(
+      paging = FALSE,
+      dom = "t",
+      scrollX = TRUE,
+      ordering = FALSE
+    )
+  )
+}
+
+datatable_cart <- function(df) {
+  datatable(
+    df,
+    rownames = FALSE,
+    options = list(
+      pageLength = 10,
+      scrollX = TRUE
+    )
+  )
+}
+
+presence_dot <- function(status) {
+  if (is.na(status) || status == "" || status == "none") {
+    return(tags$span(class = "presence-dot presence-empty", title = "Not present"))
+  }
+  
+  if (status == "exact") {
+    return(tags$span(class = "presence-dot presence-exact", title = "Exact item present"))
+  }
+  
+  if (status == "variant") {
+    return(tags$span(class = "presence-dot presence-variant", title = "Possible item variation present"))
+  }
+  
+  tags$span(class = "presence-dot presence-empty", title = "Not present")
+}
+
+presence_matrix_ui <- function(matrix_df, row_label = "Study") {
+  if (nrow(matrix_df) == 0) {
+    return(
+      div(
+        class = "empty-state",
+        p(class = "text-muted", "No longitudinal information available.")
+      )
+    )
+  }
+  
+  row_col <- names(matrix_df)[1]
+  year_cols <- setdiff(names(matrix_df), row_col)
+  
+  if (length(year_cols) == 0) {
+    return(
+      div(
+        class = "empty-state",
+        p(class = "text-muted", "No year information available.")
+      )
+    )
+  }
+  
+  div(
+    class = "presence-table-wrapper",
+    tags$table(
+      class = "presence-table",
+      tags$thead(
+        tags$tr(
+          tags$th(class = "presence-row-label", row_label),
+          lapply(year_cols, function(y) {
+            tags$th(class = "presence-year", y)
+          })
+        )
+      ),
+      tags$tbody(
+        lapply(seq_len(nrow(matrix_df)), function(i) {
+          tags$tr(
+            tags$td(
+              class = "presence-row-label",
+              matrix_df[[row_col]][i]
+            ),
+            lapply(year_cols, function(y) {
+              tags$td(
+                class = "presence-cell",
+                presence_dot(matrix_df[[y]][i])
+              )
+            })
+          )
+        })
+      )
+    ),
+    div(
+      class = "presence-legend",
+      span(class = "presence-dot presence-exact"),
+      span("Exact item"),
+      span(class = "presence-dot presence-variant ms-3"),
+      span("Possible variation"),
+      span(class = "presence-dot presence-empty ms-3"),
+      span("Not present")
+    )
+  )
+}
+
 # ------------------------------------------------------------
 # Standardization layer
 # ------------------------------------------------------------
 
 standardize_items <- function(df) {
+  
+  if (nrow(df) == 0) {
+    return(df)
+  }
   
   if ("wording_item" %in% names(df) && !"wording" %in% names(df)) {
     df <- df %>% rename(wording = wording_item)
@@ -344,6 +493,10 @@ get_variables_and_data <- function(pool, selected_items) {
 
 derive_scales <- function(items) {
   
+  if (nrow(items) == 0) {
+    return(tibble())
+  }
+  
   items %>%
     filter(!is.na(scale), scale != "") %>%
     distinct(
@@ -390,6 +543,10 @@ derive_scales <- function(items) {
 
 derive_questionnaires <- function(items) {
   
+  if (nrow(items) == 0) {
+    return(tibble())
+  }
+  
   items %>%
     distinct(
       study,
@@ -426,6 +583,160 @@ derive_questionnaires <- function(items) {
       ),
       questionnaire_uid = str_replace_all(questionnaire_uid, "[^A-Za-z0-9_]", "_")
     )
+}
+
+derive_item_presence_matrix <- function(item, items) {
+  
+  if (nrow(items) == 0) {
+    return(tibble())
+  }
+  
+  candidates <- items %>%
+    filter(
+      item_uid == item$item_uid |
+        (
+          source_variable != "" &
+            item$source_variable != "" &
+            source_variable == item$source_variable
+        ) |
+        (
+          item_code != "" &
+            item$item_code != "" &
+            item_code == item$item_code
+        )
+    )
+  
+  if (nrow(candidates) == 0) {
+    return(tibble())
+  }
+  
+  studies <- sort(unique(candidates$study))
+  studies <- studies[studies != ""]
+  
+  years <- sort_years_desc(candidates$year)
+  
+  if (length(studies) == 0 || length(years) == 0) {
+    return(tibble())
+  }
+  
+  out <- data.frame(
+    study = studies,
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+  )
+  
+  for (yr in years) {
+    out[[yr]] <- vapply(
+      studies,
+      function(st) {
+        cell <- candidates %>%
+          filter(study == st, year == yr)
+        
+        if (nrow(cell) == 0) {
+          "none"
+        } else if (any(cell$item_uid == item$item_uid)) {
+          "exact"
+        } else {
+          "variant"
+        }
+      },
+      character(1)
+    )
+  }
+  
+  as_tibble(out)
+}
+
+derive_scale_source <- function(scale_row, items) {
+  
+  if (nrow(items) == 0) {
+    return(tibble())
+  }
+  
+  if (!is.na(scale_row$scale_id) && scale_row$scale_id != "") {
+    df <- items %>%
+      filter(scale_id == scale_row$scale_id)
+  } else if (!is.na(scale_row$scale_varname) && scale_row$scale_varname != "") {
+    df <- items %>%
+      filter(scale_varname == scale_row$scale_varname)
+  } else {
+    df <- items %>%
+      filter(scale == scale_row$scale)
+  }
+  
+  df
+}
+
+derive_scale_item_presence_matrix <- function(current_scale_items, scale_source, selected_study) {
+  
+  if (nrow(current_scale_items) == 0 || nrow(scale_source) == 0) {
+    return(tibble())
+  }
+  
+  source <- scale_source %>%
+    filter(study == selected_study)
+  
+  if (nrow(source) == 0) {
+    return(tibble())
+  }
+  
+  years <- sort_years_desc(source$year)
+  
+  base_items <- current_scale_items %>%
+    distinct(
+      item_uid,
+      item_code,
+      source_variable,
+      wording,
+      .keep_all = TRUE
+    ) %>%
+    arrange(item_uid)
+  
+  if (length(years) == 0 || nrow(base_items) == 0) {
+    return(tibble())
+  }
+  
+  out <- data.frame(
+    item_uid = base_items$item_uid,
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+  )
+  
+  for (yr in years) {
+    out[[yr]] <- vapply(
+      seq_len(nrow(base_items)),
+      function(i) {
+        item <- base_items[i, ]
+        
+        cell <- source %>%
+          filter(year == yr) %>%
+          filter(
+            item_uid == item$item_uid |
+              (
+                source_variable != "" &
+                  item$source_variable != "" &
+                  source_variable == item$source_variable
+              ) |
+              (
+                item_code != "" &
+                  item$item_code != "" &
+                  item_code == item$item_code
+              )
+          )
+        
+        if (nrow(cell) == 0) {
+          "none"
+        } else if (any(cell$item_uid == item$item_uid)) {
+          "exact"
+        } else {
+          "variant"
+        }
+      },
+      character(1)
+    )
+  }
+  
+  as_tibble(out)
 }
 
 # ------------------------------------------------------------
@@ -563,11 +874,12 @@ item_card <- function(item) {
         span(
           class = "badge rounded-pill text-bg-light",
           item$trend_status
-        ),
-        span(
-          class = "badge rounded-pill text-bg-light",
-          "Details →"
         )
+      ),
+      actionButton(
+        inputId = paste0("details_item_", item_uid_safe),
+        label = "Details →",
+        class = "btn btn-sm btn-outline-primary mt-2"
       )
     )
   )
@@ -614,7 +926,11 @@ scale_card <- function(scale_row) {
       ),
       div(
         class = "mt-2",
-        span(class = "badge rounded-pill text-bg-light", "View scale →")
+        actionButton(
+          inputId = paste0("details_scale_", scale_uid_safe),
+          label = "View scale →",
+          class = "btn btn-sm btn-outline-primary"
+        )
       )
     )
   )
@@ -656,7 +972,11 @@ questionnaire_card <- function(questionnaire_row) {
       div(paste(questionnaire_row$n_scales, "scales")),
       div(
         class = "mt-2",
-        span(class = "badge rounded-pill text-bg-light", "View questionnaire →")
+        actionButton(
+          inputId = paste0("details_questionnaire_", questionnaire_uid_safe),
+          label = "View questionnaire →",
+          class = "btn btn-sm btn-outline-primary"
+        )
       )
     )
   )
@@ -666,564 +986,770 @@ questionnaire_card <- function(questionnaire_row) {
 # UI
 # ------------------------------------------------------------
 
-ui <- tagList(
+ui <- page_navbar(
+  id = "main_nav",
+  title = app_brand,
+  theme = app_theme,
+  fillable = FALSE,
+  footer = app_footer,
   
-  page_navbar(
-    id = "main_nav",
-    title = app_brand,
-    theme = app_theme,
-    
-    header = tags$head(
-      tags$style(HTML("
-        :root {
-          --iea-blue: #0070b8;
-          --iea-red: #e2211c;
-          --iea-bg: #F7F9FC;
-          --iea-border: #E5E7EB;
-          --iea-text: #1F2937;
-          --iea-muted: #6B7280;
-        }
+  header = tags$head(
+    tags$style(HTML("
+      :root {
+        --iea-blue: #0070b8;
+        --iea-red: #e2211c;
+        --iea-bg: #F7F9FC;
+        --iea-border: #E5E7EB;
+        --iea-text: #1F2937;
+        --iea-muted: #6B7280;
+      }
 
-        body {
-          background-color: var(--iea-bg);
-          color: var(--iea-text);
-        }
+      html,
+      body {
+        min-height: 100%;
+      }
 
+      body {
+        background-color: var(--iea-bg);
+        color: var(--iea-text);
+        overflow-x: hidden;
+      }
+
+      .bslib-page-navbar {
+        min-height: 100vh;
+      }
+
+      .bslib-page-navbar > .tab-content {
+        padding-bottom: 2rem;
+      }
+
+      .tab-content {
+        overflow: visible;
+      }
+
+      .navbar {
+        border-bottom: 1px solid #D9DEE5;
+        background-color: #FFFFFF !important;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+        padding-top: 0.6rem;
+        padding-bottom: 0.6rem;
+        min-height: 76px;
+      }
+
+      .navbar > .container-fluid {
+        display: grid;
+        grid-template-columns: auto minmax(0, 1fr) auto;
+        align-items: center;
+        column-gap: 3.5rem;
+      }
+
+      .navbar-brand {
+        padding-top: 0;
+        padding-bottom: 0;
+        margin-right: 0;
+        display: flex;
+        align-items: center;
+        min-height: 58px;
+        grid-column: 1;
+      }
+
+      .app-brand {
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+        min-height: 58px;
+      }
+
+      .app-logo {
+        height: 48px;
+        width: auto;
+        display: block;
+        flex: 0 0 auto;
+      }
+
+      .app-title {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 48px;
+        line-height: 1;
+        margin: 0;
+        padding: 0;
+      }
+
+      .app-title-main {
+        font-weight: 700;
+        font-size: 1.08rem;
+        color: #222222;
+        letter-spacing: 0.01em;
+        white-space: nowrap;
+        margin: 0;
+        padding: 0;
+        line-height: 1;
+      }
+
+      .navbar-toggler {
+        grid-column: 3;
+      }
+
+      .navbar-collapse {
+        grid-column: 2;
+        display: flex !important;
+        justify-content: center;
+        align-items: center;
+      }
+
+      .navbar-nav {
+        margin-left: auto;
+        margin-right: auto;
+        gap: 1.15rem;
+        align-items: center;
+      }
+
+      .navbar-nav .nav-link {
+        position: relative;
+        font-weight: 600;
+        color: #2F3A45 !important;
+        padding-left: 0.35rem !important;
+        padding-right: 0.35rem !important;
+        border-radius: 0;
+        background: transparent !important;
+        white-space: nowrap;
+      }
+
+      .navbar-nav .nav-link:hover {
+        color: var(--iea-red) !important;
+      }
+
+      .navbar-nav .nav-link.active {
+        color: var(--iea-red) !important;
+        font-weight: 700;
+        background: transparent !important;
+      }
+
+      .btn-primary {
+        background-color: var(--iea-blue);
+        border-color: var(--iea-blue);
+      }
+
+      .btn-primary:hover {
+        background-color: #005f9e;
+        border-color: #005f9e;
+      }
+
+      .btn-outline-primary {
+        color: var(--iea-blue);
+        border-color: var(--iea-blue);
+      }
+
+      .btn-outline-primary:hover {
+        background-color: var(--iea-blue);
+        border-color: var(--iea-blue);
+        color: #FFFFFF;
+      }
+
+      .btn-modal-action {
+        margin-right: 0.4rem;
+        margin-bottom: 0.4rem;
+      }
+
+      .page-header {
+        padding: 1.5rem 0 1rem 0;
+      }
+
+      .page-header h2 {
+        margin-bottom: 0.25rem;
+        font-weight: 700;
+        color: #1F2937;
+      }
+
+      .page-header h2::after {
+        content: '';
+        display: block;
+        width: 44px;
+        height: 3px;
+        background: var(--iea-red);
+        border-radius: 999px;
+        margin-top: 0.55rem;
+      }
+
+      .filter-panel {
+        background: #FFFFFF;
+        border: 1px solid var(--iea-border);
+        border-radius: 12px;
+        padding: 1rem;
+        position: sticky;
+        top: 1rem;
+        max-width: 100%;
+      }
+
+      .filter-panel h5 {
+        color: #111827;
+        font-weight: 700;
+        margin-bottom: 1rem;
+      }
+
+      .item-card,
+      .scale-card,
+      .questionnaire-card {
+        border: 1px solid var(--iea-border);
+        border-radius: 14px;
+        margin-bottom: 1rem;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+        background-color: #FFFFFF;
+        overflow: hidden;
+        max-width: 100%;
+      }
+
+      .item-card::before,
+      .scale-card::before,
+      .questionnaire-card::before {
+        content: '';
+        display: block;
+        height: 4px;
+        background: var(--iea-red);
+      }
+
+      .item-card:hover,
+      .scale-card:hover,
+      .questionnaire-card:hover {
+        box-shadow: 0 6px 18px rgba(0,0,0,0.07);
+        transform: translateY(-1px);
+        transition: box-shadow 0.15s ease-in-out, transform 0.15s ease-in-out;
+      }
+
+      .item-card h5,
+      .scale-card h5,
+      .questionnaire-card h5 {
+        color: #111827;
+        font-weight: 700;
+      }
+
+      .item-wording {
+        font-size: 1.05rem;
+        margin-bottom: 0;
+        color: #1F2937;
+      }
+
+      .badge {
+        margin-right: 0.25rem;
+        border: 1px solid var(--iea-border);
+        font-weight: 600;
+      }
+
+      .badge.text-bg-light {
+        background-color: #F8FAFC !important;
+        color: #334155 !important;
+      }
+
+      .cart-summary {
+        background: #FFFFFF;
+        border: 1px solid var(--iea-border);
+        border-radius: 14px;
+        padding: 1rem;
+        margin-bottom: 1rem;
+        max-width: 100%;
+      }
+
+      .empty-state {
+        background: #FFFFFF;
+        border: 1px dashed #CBD5E1;
+        border-radius: 14px;
+        padding: 2rem;
+        text-align: center;
+      }
+
+      .home-hero {
+        background: #FFFFFF;
+        border: 1px solid var(--iea-border);
+        border-radius: 18px;
+        padding: 2.25rem;
+        margin-top: 1.5rem;
+        margin-bottom: 1.5rem;
+        position: relative;
+        overflow: hidden;
+      }
+
+      .home-hero::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 6px;
+        height: 100%;
+        background: var(--iea-red);
+      }
+
+      .home-hero h1 {
+        color: #1F2937;
+        font-weight: 750;
+        max-width: 900px;
+      }
+
+      .home-hero .lead {
+        color: #4B5563 !important;
+      }
+
+      .home-card {
+        border: 1px solid var(--iea-border);
+        border-radius: 14px;
+        background-color: #FFFFFF;
+        min-height: 180px;
+      }
+
+      .home-card h4 {
+        color: var(--iea-blue);
+        font-weight: 700;
+      }
+
+      a {
+        color: var(--iea-blue);
+      }
+
+      .app-footer {
+        position: relative;
+        z-index: 1;
+        margin-top: 2rem;
+        border-top: 1px solid #D9DEE5;
+        background: #FFFFFF;
+        padding: 1rem 1.25rem;
+        flex-shrink: 0;
+      }
+
+      .app-footer-inner {
+        max-width: 1400px;
+        margin: 0 auto;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+        gap: 0.25rem;
+        font-size: 0.92rem;
+        color: var(--iea-muted);
+      }
+
+      .footer-line {
+        width: 100%;
+        text-align: center;
+        line-height: 1.35;
+      }
+
+      .footer-version strong {
+        color: #1F2937;
+      }
+
+      .footer-copyright {
+        color: var(--iea-muted);
+      }
+
+      .version-easter-egg {
+        color: var(--iea-muted) !important;
+        text-decoration: none !important;
+        cursor: default;
+        font-weight: 500;
+      }
+
+      .version-easter-egg:hover,
+      .version-easter-egg:focus,
+      .version-easter-egg:active {
+        color: var(--iea-muted) !important;
+        text-decoration: none !important;
+        outline: none !important;
+        box-shadow: none !important;
+      }
+
+      .dataTables_wrapper {
+        margin-bottom: 2rem;
+        max-width: 100%;
+      }
+
+      .dataTables_wrapper .dataTables_length {
+        display: none !important;
+      }
+
+      .shiny-bound-output {
+        max-width: 100%;
+      }
+
+      .card {
+        max-width: 100%;
+      }
+
+      .detail-modal h5 {
+        font-weight: 700;
+        color: #1F2937;
+        margin-top: 0.5rem;
+      }
+
+      .detail-modal h6 {
+        font-weight: 700;
+        color: #374151;
+        margin-top: 0.5rem;
+      }
+
+      .detail-modal p {
+        margin-bottom: 0.35rem;
+      }
+
+      .detail-section {
+        background: #F8FAFC;
+        border: 1px solid var(--iea-border);
+        border-radius: 12px;
+        padding: 1rem;
+        margin-bottom: 1rem;
+      }
+
+      .modal-title {
+        font-weight: 700;
+        color: #1F2937;
+      }
+
+      .modal-content {
+        border-radius: 16px;
+        border: 1px solid var(--iea-border);
+      }
+
+      .modal-header {
+        border-bottom: 1px solid var(--iea-border);
+      }
+
+      .modal-footer {
+        border-top: 1px solid var(--iea-border);
+      }
+
+      .modal-xl {
+        max-width: 1180px;
+      }
+
+      .selectize-control {
+        margin-bottom: 1rem;
+      }
+
+      .presence-table-wrapper {
+        width: 100%;
+        overflow-x: auto;
+        border: 1px solid var(--iea-border);
+        border-radius: 12px;
+        background: #FFFFFF;
+      }
+
+      .presence-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.88rem;
+      }
+
+      .presence-table thead th {
+        background: linear-gradient(#0070b8, #005f9e);
+        color: #FFFFFF;
+        font-weight: 700;
+        text-align: center;
+        padding: 0.4rem 0.45rem;
+        white-space: nowrap;
+        border-right: 1px solid rgba(255,255,255,0.25);
+      }
+
+      .presence-table tbody tr:nth-child(even) {
+        background: #F1F7FD;
+      }
+
+      .presence-table tbody tr:nth-child(odd) {
+        background: #FFFFFF;
+      }
+
+      .presence-row-label {
+        text-align: left !important;
+        min-width: 170px;
+        max-width: 320px;
+        white-space: nowrap;
+        font-weight: 600;
+      }
+
+      .presence-table tbody td {
+        padding: 0.35rem 0.45rem;
+        border-bottom: 1px solid #E5E7EB;
+        border-right: 1px solid #E5E7EB;
+        vertical-align: middle;
+      }
+
+      .presence-cell {
+        text-align: center;
+        min-width: 48px;
+      }
+
+      .presence-dot {
+        display: inline-block;
+        width: 13px;
+        height: 13px;
+        border-radius: 50%;
+        vertical-align: middle;
+        border: 1px solid #CBD5E1;
+      }
+
+      .presence-exact {
+        background: var(--iea-red);
+        border-color: var(--iea-red);
+      }
+
+      .presence-variant {
+        background: linear-gradient(to right, var(--iea-red) 50%, transparent 50%);
+        border-color: var(--iea-red);
+      }
+
+      .presence-empty {
+        background: transparent;
+        border-color: transparent;
+      }
+
+      .presence-legend {
+        padding: 0.65rem 0.75rem;
+        font-size: 0.85rem;
+        color: var(--iea-muted);
+        border-top: 1px solid var(--iea-border);
+        background: #F8FAFC;
+      }
+
+      @media (max-width: 991px) {
         .navbar {
-          border-bottom: 1px solid #D9DEE5;
-          background-color: #FFFFFF !important;
-          box-shadow: 0 1px 2px rgba(0,0,0,0.03);
-          padding-top: 0.6rem;
-          padding-bottom: 0.6rem;
-          min-height: 76px;
+          min-height: 68px;
         }
 
         .navbar > .container-fluid {
-          display: grid;
-          grid-template-columns: auto minmax(0, 1fr) auto;
+          display: flex;
           align-items: center;
-          column-gap: 3.5rem;
+          column-gap: 1rem;
         }
 
         .navbar-brand {
-          padding-top: 0;
-          padding-bottom: 0;
-          margin-right: 0;
-          display: flex;
-          align-items: center;
-          min-height: 58px;
-          grid-column: 1;
-        }
-
-        .app-brand {
-          display: flex;
-          align-items: center;
-          gap: 1rem;
-          min-height: 58px;
-        }
-
-        .app-logo {
-          height: 48px;
-          width: auto;
-          display: block;
-          flex: 0 0 auto;
-        }
-
-        .app-title {
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          min-height: 48px;
-          line-height: 1;
-          margin: 0;
-          padding: 0;
-        }
-
-        .app-title-main {
-          font-weight: 700;
-          font-size: 1.08rem;
-          color: #222222;
-          letter-spacing: 0.01em;
-          white-space: nowrap;
-          margin: 0;
-          padding: 0;
-          line-height: 1;
-        }
-
-        .navbar-toggler {
-          grid-column: 3;
+          min-height: 50px;
         }
 
         .navbar-collapse {
-          grid-column: 2;
-          display: flex !important;
-          justify-content: center;
-          align-items: center;
+          justify-content: flex-start;
         }
 
         .navbar-nav {
-          margin-left: auto;
-          margin-right: auto;
-          gap: 1.15rem;
-          align-items: center;
+          margin-left: 0;
+          margin-right: 0;
+          gap: 0;
+          align-items: flex-start;
         }
 
-        .navbar-nav .nav-link {
-          position: relative;
-          font-weight: 600;
-          color: #2F3A45 !important;
-          padding-left: 0.35rem !important;
-          padding-right: 0.35rem !important;
-          border-radius: 0;
-          background: transparent !important;
-          white-space: nowrap;
+        .app-brand {
+          min-height: 50px;
+          gap: 0.75rem;
         }
 
-        .navbar-nav .nav-link:hover {
-          color: var(--iea-red) !important;
+        .app-logo {
+          height: 40px;
         }
 
-        .navbar-nav .nav-link.active {
-          color: var(--iea-red) !important;
-          font-weight: 700;
-          background: transparent !important;
+        .app-title {
+          min-height: 40px;
         }
 
-        .btn-primary {
-          background-color: var(--iea-blue);
-          border-color: var(--iea-blue);
-        }
-
-        .btn-primary:hover {
-          background-color: #005f9e;
-          border-color: #005f9e;
-        }
-
-        .btn-outline-primary {
-          color: var(--iea-blue);
-          border-color: var(--iea-blue);
-        }
-
-        .btn-outline-primary:hover {
-          background-color: var(--iea-blue);
-          border-color: var(--iea-blue);
-          color: #FFFFFF;
-        }
-
-        .page-header {
-          padding: 1.5rem 0 1rem 0;
-        }
-
-        .page-header h2 {
-          margin-bottom: 0.25rem;
-          font-weight: 700;
-          color: #1F2937;
-        }
-
-        .page-header h2::after {
-          content: '';
-          display: block;
-          width: 44px;
-          height: 3px;
-          background: var(--iea-red);
-          border-radius: 999px;
-          margin-top: 0.55rem;
+        .app-title-main {
+          font-size: 1rem;
         }
 
         .filter-panel {
-          background: #FFFFFF;
-          border: 1px solid var(--iea-border);
-          border-radius: 12px;
-          padding: 1rem;
-          position: sticky;
-          top: 1rem;
-        }
-
-        .filter-panel h5 {
-          color: #111827;
-          font-weight: 700;
-          margin-bottom: 1rem;
-        }
-
-        .item-card,
-        .scale-card,
-        .questionnaire-card {
-          border: 1px solid var(--iea-border);
-          border-radius: 14px;
-          margin-bottom: 1rem;
-          box-shadow: 0 1px 2px rgba(0,0,0,0.03);
-          background-color: #FFFFFF;
-          overflow: hidden;
-        }
-
-        .item-card::before,
-        .scale-card::before,
-        .questionnaire-card::before {
-          content: '';
-          display: block;
-          height: 4px;
-          background: var(--iea-red);
-        }
-
-        .item-card:hover,
-        .scale-card:hover,
-        .questionnaire-card:hover {
-          box-shadow: 0 6px 18px rgba(0,0,0,0.07);
-          transform: translateY(-1px);
-          transition: box-shadow 0.15s ease-in-out, transform 0.15s ease-in-out;
-        }
-
-        .item-card h5,
-        .scale-card h5,
-        .questionnaire-card h5 {
-          color: #111827;
-          font-weight: 700;
-        }
-
-        .item-wording {
-          font-size: 1.05rem;
-          margin-bottom: 0;
-          color: #1F2937;
-        }
-
-        .badge {
-          margin-right: 0.25rem;
-          border: 1px solid var(--iea-border);
-          font-weight: 600;
-        }
-
-        .badge.text-bg-light {
-          background-color: #F8FAFC !important;
-          color: #334155 !important;
-        }
-
-        .cart-summary {
-          background: #FFFFFF;
-          border: 1px solid var(--iea-border);
-          border-radius: 14px;
-          padding: 1rem;
-          margin-bottom: 1rem;
-        }
-
-        .empty-state {
-          background: #FFFFFF;
-          border: 1px dashed #CBD5E1;
-          border-radius: 14px;
-          padding: 2rem;
-          text-align: center;
-        }
-
-        .home-hero {
-          background: #FFFFFF;
-          border: 1px solid var(--iea-border);
-          border-radius: 18px;
-          padding: 2.25rem;
-          margin-top: 1.5rem;
-          margin-bottom: 1.5rem;
           position: relative;
-          overflow: hidden;
+          top: auto;
+          margin-bottom: 1rem;
         }
+      }
+    ")),
+    tags$script(HTML("
+      $(document).on('click', '#version_click', function(e) {
+        e.preventDefault();
 
-        .home-hero::before {
-          content: '';
-          position: absolute;
-          top: 0;
-          left: 0;
-          width: 6px;
-          height: 100%;
-          background: var(--iea-red);
+        window.__ieaVersionClicks = window.__ieaVersionClicks || 0;
+        window.__ieaVersionClicks = window.__ieaVersionClicks + 1;
+
+        if (window.__ieaVersionClicks >= 10) {
+          window.__ieaVersionClicks = 0;
+          window.open('https://www.iea.nl', '_blank');
         }
-
-        .home-hero h1 {
-          color: #1F2937;
-          font-weight: 750;
-          max-width: 900px;
-        }
-
-        .home-hero .lead {
-          color: #4B5563 !important;
-        }
-
-        .home-card {
-          border: 1px solid var(--iea-border);
-          border-radius: 14px;
-          background-color: #FFFFFF;
-          min-height: 180px;
-        }
-
-        .home-card h4 {
-          color: var(--iea-blue);
-          font-weight: 700;
-        }
-
-        a {
-          color: var(--iea-blue);
-        }
-
-        .app-footer {
-          margin-top: 2rem;
-          border-top: 1px solid #D9DEE5;
-          background: #FFFFFF;
-          padding: 1rem 1.25rem;
-        }
-
-        .app-footer-inner {
-          max-width: 1400px;
-          margin: 0 auto;
-          display: flex;
-          flex-direction: column;
-          align-items: center;
-          justify-content: center;
-          text-align: center;
-          gap: 0.25rem;
-          font-size: 0.92rem;
-          color: var(--iea-muted);
-        }
-
-        .footer-line {
-          width: 100%;
-          text-align: center;
-          line-height: 1.35;
-        }
-
-        .footer-version strong {
-          color: #1F2937;
-        }
-
-        .footer-copyright {
-          color: var(--iea-muted);
-        }
-
-        .version-easter-egg {
-          color: var(--iea-muted) !important;
-          text-decoration: none !important;
-          cursor: default;
-          font-weight: 500;
-        }
-
-        .version-easter-egg:hover {
-          color: var(--iea-red) !important;
-        }
-
-        @media (max-width: 991px) {
-          .navbar {
-            min-height: 68px;
-          }
-
-          .navbar > .container-fluid {
-            display: flex;
-            align-items: center;
-            column-gap: 1rem;
-          }
-
-          .navbar-brand {
-            min-height: 50px;
-          }
-
-          .navbar-collapse {
-            justify-content: flex-start;
-          }
-
-          .navbar-nav {
-            margin-left: 0;
-            margin-right: 0;
-            gap: 0;
-            align-items: flex-start;
-          }
-
-          .app-brand {
-            min-height: 50px;
-            gap: 0.75rem;
-          }
-
-          .app-logo {
-            height: 40px;
-          }
-
-          .app-title {
-            min-height: 40px;
-          }
-
-          .app-title-main {
-            font-size: 1rem;
-          }
-        }
-      ")),
-      tags$script(HTML("
-        Shiny.addCustomMessageHandler('open_url', function(url) {
-          window.open(url, '_blank');
-        });
-      "))
-    ),
-    
-    nav_panel(
-      "Home",
-      div(
-        class = "home-hero",
-        h1("Explore questionnaire items across studies, cycles and scales"),
-        p(
-          class = "lead text-muted",
-          "Search, compare and export item metadata from IEA studies."
-        ),
-        div(
-          class = "mt-3",
-          actionButton("go_items", "Explore items", class = "btn btn-primary"),
-          actionButton("go_scales", "Browse scales", class = "btn btn-outline-primary"),
-          actionButton("go_questionnaires", "Browse questionnaires", class = "btn btn-outline-primary")
-        )
-      ),
-      layout_columns(
-        col_widths = c(4, 4, 4),
-        card(
-          class = "home-card",
-          card_body(
-            h4("Items"),
-            p("Search individual items, wording, response options and metadata."),
-            span(class = "badge rounded-pill text-bg-light", "Item-level")
-          )
-        ),
-        card(
-          class = "home-card",
-          card_body(
-            h4("Scales"),
-            p("Browse constructs and groups of items across cycles."),
-            span(class = "badge rounded-pill text-bg-light", "Scale-level")
-          )
-        ),
-        card(
-          class = "home-card",
-          card_body(
-            h4("Questionnaires"),
-            p("Explore complete instruments, sections and questionnaire structures."),
-            span(class = "badge rounded-pill text-bg-light", "Instrument-level")
-          )
-        )
-      )
-    ),
-    
-    nav_panel(
-      "Explore Items",
-      page_header(
-        "Explore Items",
-        "Search and filter questionnaire items across IEA studies."
-      ),
-      layout_columns(
-        col_widths = c(3, 9),
-        div(
-          class = "filter-panel",
-          h5("Filters"),
-          uiOutput("filter_study_items_ui"),
-          uiOutput("filter_year_items_ui"),
-          uiOutput("filter_cycle_items_ui"),
-          uiOutput("filter_population_items_ui"),
-          uiOutput("filter_instrument_items_ui"),
-          uiOutput("filter_scale_items_ui"),
-          uiOutput("filter_type_items_ui"),
-          uiOutput("filter_puf_items_ui"),
-          actionButton(
-            "reset_item_filters",
-            "Reset filters",
-            class = "btn btn-outline-secondary btn-sm"
-          )
-        ),
-        div(
-          uiOutput("items_count"),
-          textInput(
-            "search_items",
-            NULL,
-            placeholder = "Search within items, wording, variable, scale or section..."
-          ),
-          uiOutput("items_results")
-        )
-      )
-    ),
-    
-    nav_panel(
-      "Scales",
-      page_header(
-        "Explore Scales",
-        "Browse constructs and item groups across studies and cycles."
-      ),
-      layout_columns(
-        col_widths = c(3, 9),
-        div(
-          class = "filter-panel",
-          h5("Filters"),
-          uiOutput("filter_study_scales_ui"),
-          uiOutput("filter_year_scales_ui"),
-          uiOutput("filter_cycle_scales_ui"),
-          uiOutput("filter_population_scales_ui"),
-          uiOutput("filter_instrument_scales_ui"),
-          actionButton(
-            "reset_scale_filters",
-            "Reset filters",
-            class = "btn btn-outline-secondary btn-sm"
-          )
-        ),
-        div(
-          uiOutput("scales_count"),
-          uiOutput("scales_results")
-        )
-      )
-    ),
-    
-    nav_panel(
-      "Questionnaires",
-      page_header(
-        "Explore Questionnaires",
-        "Browse complete questionnaires and instruments."
-      ),
-      layout_columns(
-        col_widths = c(3, 9),
-        div(
-          class = "filter-panel",
-          h5("Filters"),
-          uiOutput("filter_study_questionnaires_ui"),
-          uiOutput("filter_year_questionnaires_ui"),
-          uiOutput("filter_cycle_questionnaires_ui"),
-          uiOutput("filter_population_questionnaires_ui"),
-          uiOutput("filter_instrument_questionnaires_ui"),
-          actionButton(
-            "reset_questionnaire_filters",
-            "Reset filters",
-            class = "btn btn-outline-secondary btn-sm"
-          )
-        ),
-        div(
-          uiOutput("questionnaires_count"),
-          uiOutput("questionnaires_results")
-        )
-      )
-    ),
-    
-    nav_panel(
-      "Selection Cart",
-      page_header(
-        "Selection Cart",
-        "Review selected unique items and export structured metadata."
+      });
+    "))
+  ),
+  
+  nav_panel(
+    "Home",
+    div(
+      class = "home-hero",
+      h1("Explore questionnaire items across studies, cycles and scales"),
+      p(
+        class = "lead text-muted",
+        "Search, compare and export item metadata from IEA studies."
       ),
       div(
-        class = "cart-summary",
-        uiOutput("cart_summary"),
-        div(
-          class = "mt-2",
-          downloadButton(
-            "download_excel",
-            "Download Excel",
-            class = "btn btn-primary"
-          ),
-          actionButton(
-            "clear_cart",
-            "Clear cart",
-            class = "btn btn-outline-secondary"
-          )
+        class = "mt-3",
+        actionButton("go_items", "Explore items", class = "btn btn-primary"),
+        actionButton("go_scales", "Browse scales", class = "btn btn-outline-primary"),
+        actionButton("go_questionnaires", "Browse questionnaires", class = "btn btn-outline-primary")
+      )
+    ),
+    layout_columns(
+      col_widths = c(4, 4, 4),
+      card(
+        class = "home-card",
+        card_body(
+          h4("Items"),
+          p("Search individual items, wording, response options and metadata."),
+          span(class = "badge rounded-pill text-bg-light", "Item-level")
         )
       ),
-      DTOutput("cart_table")
+      card(
+        class = "home-card",
+        card_body(
+          h4("Scales"),
+          p("Browse constructs and groups of items across cycles."),
+          span(class = "badge rounded-pill text-bg-light", "Scale-level")
+        )
+      ),
+      card(
+        class = "home-card",
+        card_body(
+          h4("Questionnaires"),
+          p("Explore complete instruments, sections and questionnaire structures."),
+          span(class = "badge rounded-pill text-bg-light", "Instrument-level")
+        )
+      )
     )
   ),
   
-  app_footer
+  nav_panel(
+    "Explore Items",
+    page_header(
+      "Explore Items",
+      "Search and filter questionnaire items across IEA studies."
+    ),
+    layout_columns(
+      col_widths = c(3, 9),
+      div(
+        class = "filter-panel",
+        h5("Filters"),
+        uiOutput("filter_study_items_ui"),
+        uiOutput("filter_year_items_ui"),
+        uiOutput("filter_cycle_items_ui"),
+        uiOutput("filter_population_items_ui"),
+        uiOutput("filter_instrument_items_ui"),
+        uiOutput("filter_scale_items_ui"),
+        uiOutput("filter_type_items_ui"),
+        uiOutput("filter_puf_items_ui"),
+        actionButton(
+          "reset_item_filters",
+          "Reset filters",
+          class = "btn btn-outline-secondary btn-sm"
+        )
+      ),
+      div(
+        uiOutput("items_count"),
+        textInput(
+          "search_items",
+          NULL,
+          placeholder = "Search within items, wording, variable, scale or section..."
+        ),
+        uiOutput("items_results")
+      )
+    )
+  ),
+  
+  nav_panel(
+    "Scales",
+    page_header(
+      "Explore Scales",
+      "Browse constructs and item groups across studies and cycles."
+    ),
+    layout_columns(
+      col_widths = c(3, 9),
+      div(
+        class = "filter-panel",
+        h5("Filters"),
+        uiOutput("filter_study_scales_ui"),
+        uiOutput("filter_year_scales_ui"),
+        uiOutput("filter_cycle_scales_ui"),
+        uiOutput("filter_population_scales_ui"),
+        uiOutput("filter_instrument_scales_ui"),
+        actionButton(
+          "reset_scale_filters",
+          "Reset filters",
+          class = "btn btn-outline-secondary btn-sm"
+        )
+      ),
+      div(
+        uiOutput("scales_count"),
+        textInput(
+          "search_scales",
+          NULL,
+          placeholder = "Search within scales, scale variables, study, cycle, target or instrument..."
+        ),
+        uiOutput("scales_results")
+      )
+    )
+  ),
+  
+  nav_panel(
+    "Questionnaires",
+    page_header(
+      "Explore Questionnaires",
+      "Browse complete questionnaires and instruments."
+    ),
+    layout_columns(
+      col_widths = c(3, 9),
+      div(
+        class = "filter-panel",
+        h5("Filters"),
+        uiOutput("filter_study_questionnaires_ui"),
+        uiOutput("filter_year_questionnaires_ui"),
+        uiOutput("filter_cycle_questionnaires_ui"),
+        uiOutput("filter_population_questionnaires_ui"),
+        uiOutput("filter_instrument_questionnaires_ui"),
+        actionButton(
+          "reset_questionnaire_filters",
+          "Reset filters",
+          class = "btn btn-outline-secondary btn-sm"
+        )
+      ),
+      div(
+        uiOutput("questionnaires_count"),
+        textInput(
+          "search_questionnaires",
+          NULL,
+          placeholder = "Search within questionnaires, study, cycle, target or instrument..."
+        ),
+        uiOutput("questionnaires_results")
+      )
+    )
+  ),
+  
+  nav_panel(
+    "Selection Cart",
+    page_header(
+      "Selection Cart",
+      "Review selected unique items and export structured metadata."
+    ),
+    div(
+      class = "cart-summary",
+      uiOutput("cart_summary"),
+      div(
+        class = "mt-2",
+        downloadButton(
+          "download_excel",
+          "Download Excel",
+          class = "btn btn-primary"
+        ),
+        actionButton(
+          "clear_cart",
+          "Clear cart",
+          class = "btn btn-outline-secondary"
+        )
+      )
+    ),
+    DTOutput("cart_table")
+  )
 )
 
 # ------------------------------------------------------------
@@ -1231,32 +1757,6 @@ ui <- tagList(
 # ------------------------------------------------------------
 
 server <- function(input, output, session) {
-  
-  # ----------------------------------------------------------
-  # Easter egg: 10 clicks on version opens IEA website
-  # ----------------------------------------------------------
-  
-  version_clicks <- reactiveVal(0)
-  
-  observeEvent(input$version_click, {
-    n <- version_clicks() + 1
-    version_clicks(n)
-    
-    if (n >= 10) {
-      version_clicks(0)
-      
-      showNotification(
-        "Opening IEA website...",
-        type = "message",
-        duration = 2
-      )
-      
-      session$sendCustomMessage(
-        type = "open_url",
-        message = "https://www.iea.nl"
-      )
-    }
-  })
   
   # ----------------------------------------------------------
   # Load data from Supabase
@@ -1275,6 +1775,501 @@ server <- function(input, output, session) {
   })
   
   # ----------------------------------------------------------
+  # Modal reactive stores
+  # ----------------------------------------------------------
+  
+  modal_item <- reactiveVal(tibble())
+  modal_item_presence_matrix <- reactiveVal(tibble())
+  
+  modal_scale_items <- reactiveVal(tibble())
+  modal_scale_source <- reactiveVal(tibble())
+  
+  modal_questionnaire_items <- reactiveVal(tibble())
+  
+  modal_questionnaire_filtered_items <- reactive({
+    df <- modal_questionnaire_items()
+    
+    if (nrow(df) == 0) {
+      return(df)
+    }
+    
+    selected_scales <- input$questionnaire_scale_filter
+    
+    if (!is.null(selected_scales) && length(selected_scales) > 0) {
+      df <- df %>%
+        filter(scale %in% selected_scales)
+    }
+    
+    df
+  })
+  
+  modal_scale_presence_matrix <- reactive({
+    current_items <- modal_scale_items()
+    source <- modal_scale_source()
+    selected_study <- input$scale_longitudinal_study_filter
+    
+    if (is.null(selected_study) || selected_study == "") {
+      return(tibble())
+    }
+    
+    derive_scale_item_presence_matrix(
+      current_scale_items = current_items,
+      scale_source = source,
+      selected_study = selected_study
+    )
+  })
+  
+  # ----------------------------------------------------------
+  # Cart
+  # ----------------------------------------------------------
+  
+  cart <- reactiveVal(tibble())
+  
+  add_items_to_cart <- function(new_items) {
+    
+    if (nrow(new_items) == 0) {
+      showNotification(
+        "No items to add.",
+        type = "warning",
+        duration = 2
+      )
+      return(NULL)
+    }
+    
+    current <- cart()
+    
+    updated <- bind_rows(current, new_items) %>%
+      standardize_items() %>%
+      distinct(item_uid, .keep_all = TRUE)
+    
+    n_added <- nrow(updated) - nrow(current)
+    
+    cart(updated)
+    
+    show_added_notification(max(n_added, 0))
+  }
+  
+  # ----------------------------------------------------------
+  # Detail modal helpers
+  # ----------------------------------------------------------
+  
+  show_item_details_modal <- function(item, all_items) {
+    
+    item_matrix <- derive_item_presence_matrix(item, all_items)
+    
+    modal_item(item)
+    modal_item_presence_matrix(item_matrix)
+    
+    showModal(
+      modalDialog(
+        title = paste("Item details:", item$item_code),
+        size = "xl",
+        easyClose = TRUE,
+        footer = tagList(
+          actionButton(
+            "modal_add_item_to_cart",
+            "Add item to cart",
+            class = "btn btn-primary"
+          ),
+          modalButton("Close")
+        ),
+        
+        div(
+          class = "detail-modal",
+          
+          div(
+            class = "detail-section",
+            h5("Item wording"),
+            p(ifelse(item$wording == "", "No wording available.", item$wording))
+          ),
+          
+          layout_columns(
+            col_widths = c(6, 6),
+            
+            div(
+              class = "detail-section",
+              h5("Administration"),
+              p(strong("Study: "), item$study),
+              p(strong("Phase: "), item$phase),
+              p(strong("Year: "), item$year),
+              p(strong("Cycle: "), item$cycle),
+              p(strong("Target: "), item$population),
+              p(strong("Instrument: "), item$instrument)
+            ),
+            
+            div(
+              class = "detail-section",
+              h5("Item metadata"),
+              p(strong("Item UID: "), item$item_uid),
+              p(strong("Item code: "), item$item_code),
+              p(strong("Source variable: "), item$source_variable),
+              p(strong("Dataset label: "), item$dataset_label),
+              p(strong("Item type: "), item$item_type),
+              p(strong("PUF: "), as.character(item$puf)),
+              p(strong("Trend status: "), item$trend_status)
+            )
+          ),
+          
+          layout_columns(
+            col_widths = c(6, 6),
+            
+            div(
+              class = "detail-section",
+              h5("Scale information"),
+              p(strong("Scale ID: "), item$scale_id),
+              p(strong("Scale name: "), item$scale),
+              p(strong("Scale variable: "), item$scale_varname)
+            ),
+            
+            div(
+              class = "detail-section",
+              h5("Response and missing schemes"),
+              p(strong("Response ID: "), item$response_id),
+              p(strong("Missing ID: "), item$miss_id),
+              p(strong("Response format: "), item$response_format)
+            )
+          ),
+          
+          div(
+            class = "detail-section",
+            h5("Additional wording fields"),
+            p(strong("Question: "), item$wording_question),
+            p(strong("Instruction: "), item$wording_instruction),
+            p(strong("Context: "), item$wording_context),
+            p(strong("Heading: "), item$wording_heading)
+          ),
+          
+          div(
+            class = "detail-section",
+            h5("Longitudinal item participation"),
+            p(
+              class = "text-muted",
+              "Rows represent studies. Columns represent years. A full red dot means the same item UID is present; a half red dot means a possible variation was detected using the same source variable or item code."
+            ),
+            uiOutput("item_presence_matrix")
+          )
+        )
+      )
+    )
+  }
+  
+  show_scale_details_modal <- function(scale_row, all_items) {
+    
+    scale_items <- all_items %>%
+      filter(
+        study == scale_row$study,
+        year == scale_row$year,
+        cycle == scale_row$cycle,
+        population == scale_row$population,
+        instrument == scale_row$instrument,
+        scale_id == scale_row$scale_id
+      ) %>%
+      distinct(item_uid, .keep_all = TRUE) %>%
+      arrange(item_uid)
+    
+    scale_source <- derive_scale_source(scale_row, all_items)
+    
+    modal_scale_items(scale_items)
+    modal_scale_source(scale_source)
+    
+    study_choices <- scale_source %>%
+      filter(study != "") %>%
+      distinct(study) %>%
+      arrange(study) %>%
+      pull(study)
+    
+    if (length(study_choices) == 0) {
+      study_choices <- scale_row$study
+    }
+    
+    selected_study <- if (scale_row$study %in% study_choices) {
+      scale_row$study
+    } else {
+      study_choices[1]
+    }
+    
+    showModal(
+      modalDialog(
+        title = paste("Scale details:", scale_row$scale),
+        size = "xl",
+        easyClose = TRUE,
+        footer = modalButton("Close"),
+        
+        div(
+          class = "detail-modal",
+          
+          layout_columns(
+            col_widths = c(6, 6),
+            
+            div(
+              class = "detail-section",
+              h5("Scale"),
+              p(strong("Scale ID: "), scale_row$scale_id),
+              p(strong("Scale name: "), scale_row$scale),
+              p(strong("Scale variable: "), scale_row$scale_varname),
+              p(strong("Items: "), scale_row$n_items),
+              p(strong("Trend items: "), scale_row$n_trend_items)
+            ),
+            
+            div(
+              class = "detail-section",
+              h5("Administration"),
+              p(strong("Study: "), scale_row$study),
+              p(strong("Year: "), scale_row$year),
+              p(strong("Cycle: "), scale_row$cycle),
+              p(strong("Target: "), scale_row$population),
+              p(strong("Instrument: "), scale_row$instrument)
+            )
+          ),
+          
+          div(
+            class = "detail-section",
+            h5("Items in this scale"),
+            p(
+              class = "text-muted",
+              "Select one or more rows to add specific items, or add the full scale."
+            ),
+            actionButton(
+              "modal_add_scale_all",
+              "Add all items in this scale",
+              class = "btn btn-primary btn-modal-action"
+            ),
+            actionButton(
+              "modal_add_scale_selected",
+              "Add selected items",
+              class = "btn btn-outline-primary btn-modal-action"
+            ),
+            DTOutput("scale_items_table")
+          ),
+          
+          div(
+            class = "detail-section",
+            h5("Longitudinal scale composition"),
+            p(
+              class = "text-muted",
+              "Rows represent item UIDs from the selected scale. Columns represent years. Select a study to inspect how the scale composition changes over time."
+            ),
+            selectInput(
+              inputId = "scale_longitudinal_study_filter",
+              label = "Study",
+              choices = study_choices,
+              selected = selected_study
+            ),
+            uiOutput("scale_presence_matrix")
+          )
+        )
+      )
+    )
+  }
+  
+  show_questionnaire_details_modal <- function(questionnaire_row, all_items) {
+    
+    questionnaire_items <- all_items %>%
+      filter(
+        study == questionnaire_row$study,
+        year == questionnaire_row$year,
+        cycle == questionnaire_row$cycle,
+        population == questionnaire_row$population,
+        instrument == questionnaire_row$instrument
+      ) %>%
+      distinct(item_uid, .keep_all = TRUE) %>%
+      arrange(section, scale, item_uid)
+    
+    modal_questionnaire_items(questionnaire_items)
+    
+    scale_choices <- questionnaire_items %>%
+      filter(!is.na(scale), scale != "") %>%
+      distinct(scale) %>%
+      arrange(scale) %>%
+      pull(scale)
+    
+    showModal(
+      modalDialog(
+        title = paste(
+          "Questionnaire details:",
+          questionnaire_row$study,
+          questionnaire_row$year,
+          questionnaire_row$population,
+          questionnaire_row$instrument
+        ),
+        size = "xl",
+        easyClose = TRUE,
+        footer = modalButton("Close"),
+        
+        div(
+          class = "detail-modal",
+          
+          layout_columns(
+            col_widths = c(6, 6),
+            
+            div(
+              class = "detail-section",
+              h5("Questionnaire"),
+              p(strong("Study: "), questionnaire_row$study),
+              p(strong("Year: "), questionnaire_row$year),
+              p(strong("Cycle: "), questionnaire_row$cycle)
+            ),
+            
+            div(
+              class = "detail-section",
+              h5("Instrument"),
+              p(strong("Target: "), questionnaire_row$population),
+              p(strong("Instrument: "), questionnaire_row$instrument),
+              p(strong("Items: "), questionnaire_row$n_items),
+              p(strong("Sections: "), questionnaire_row$n_sections),
+              p(strong("Scales: "), questionnaire_row$n_scales)
+            )
+          ),
+          
+          div(
+            class = "detail-section",
+            h5("Items in this questionnaire"),
+            p(
+              class = "text-muted",
+              "Filter by one or more scales, select rows to add specific items, or add the complete questionnaire."
+            ),
+            actionButton(
+              "modal_add_questionnaire_all",
+              "Add complete questionnaire",
+              class = "btn btn-primary btn-modal-action"
+            ),
+            actionButton(
+              "modal_add_questionnaire_selected",
+              "Add selected items",
+              class = "btn btn-outline-primary btn-modal-action"
+            ),
+            selectizeInput(
+              inputId = "questionnaire_scale_filter",
+              label = "Filter by scale",
+              choices = scale_choices,
+              selected = NULL,
+              multiple = TRUE,
+              options = list(
+                placeholder = "Select one or more scales; leave empty to show all items"
+              )
+            ),
+            DTOutput("questionnaire_items_table")
+          )
+        )
+      )
+    )
+  }
+  
+  # ----------------------------------------------------------
+  # Modal outputs
+  # ----------------------------------------------------------
+  
+  output$item_presence_matrix <- renderUI({
+    presence_matrix_ui(
+      modal_item_presence_matrix(),
+      row_label = "Study"
+    )
+  })
+  
+  output$scale_presence_matrix <- renderUI({
+    presence_matrix_ui(
+      modal_scale_presence_matrix(),
+      row_label = "Item UID"
+    )
+  })
+  
+  output$scale_items_table <- renderDT({
+    df <- modal_scale_items()
+    
+    if (nrow(df) == 0) {
+      return(datatable_simple(tibble(message = "No items available.")))
+    }
+    
+    df %>%
+      select(
+        item_uid,
+        item_code,
+        source_variable,
+        wording,
+        section,
+        item_type,
+        trend_status,
+        puf
+      ) %>%
+      datatable_all_items(selection = "multiple")
+  })
+  
+  output$questionnaire_items_table <- renderDT({
+    df <- modal_questionnaire_filtered_items()
+    
+    if (nrow(df) == 0) {
+      return(datatable_simple(tibble(message = "No items available for the selected scale filter.")))
+    }
+    
+    df %>%
+      select(
+        section,
+        scale,
+        scale_varname,
+        item_uid,
+        item_code,
+        source_variable,
+        wording,
+        item_type,
+        trend_status,
+        puf
+      ) %>%
+      datatable_all_items(selection = "multiple")
+  })
+  
+  # ----------------------------------------------------------
+  # Modal add buttons
+  # ----------------------------------------------------------
+  
+  observeEvent(input$modal_add_item_to_cart, {
+    item <- modal_item()
+    
+    if (nrow(item) > 0) {
+      add_items_to_cart(item)
+    }
+  })
+  
+  observeEvent(input$modal_add_scale_all, {
+    add_items_to_cart(modal_scale_items())
+  })
+  
+  observeEvent(input$modal_add_scale_selected, {
+    df <- modal_scale_items()
+    selected_rows <- input$scale_items_table_rows_selected
+    
+    if (is.null(selected_rows) || length(selected_rows) == 0) {
+      showNotification(
+        "Select at least one item from the scale table.",
+        type = "warning",
+        duration = 2
+      )
+      return(NULL)
+    }
+    
+    add_items_to_cart(df[selected_rows, , drop = FALSE])
+  })
+  
+  observeEvent(input$modal_add_questionnaire_all, {
+    add_items_to_cart(modal_questionnaire_items())
+  })
+  
+  observeEvent(input$modal_add_questionnaire_selected, {
+    df <- modal_questionnaire_filtered_items()
+    selected_rows <- input$questionnaire_items_table_rows_selected
+    
+    if (is.null(selected_rows) || length(selected_rows) == 0) {
+      showNotification(
+        "Select at least one item from the questionnaire table.",
+        type = "warning",
+        duration = 2
+      )
+      return(NULL)
+    }
+    
+    add_items_to_cart(df[selected_rows, , drop = FALSE])
+  })
+  
+  # ----------------------------------------------------------
   # Navigation buttons from Home
   # ----------------------------------------------------------
   
@@ -1289,22 +2284,6 @@ server <- function(input, output, session) {
   observeEvent(input$go_questionnaires, {
     nav_select("main_nav", "Questionnaires")
   })
-  
-  # ----------------------------------------------------------
-  # Cart
-  # ----------------------------------------------------------
-  
-  cart <- reactiveVal(tibble())
-  
-  add_items_to_cart <- function(new_items) {
-    current <- cart()
-    
-    updated <- bind_rows(current, new_items) %>%
-      standardize_items() %>%
-      distinct(item_uid, .keep_all = TRUE)
-    
-    cart(updated)
-  }
   
   # ----------------------------------------------------------
   # Dynamic filter UI: Items
@@ -1455,6 +2434,10 @@ server <- function(input, output, session) {
         observeEvent(input[[paste0("add_item_", item_uid_safe)]], {
           add_items_to_cart(item)
         }, ignoreInit = TRUE)
+        
+        observeEvent(input[[paste0("details_item_", item_uid_safe)]], {
+          show_item_details_modal(item, items_data())
+        }, ignoreInit = TRUE)
       })
     })
   })
@@ -1515,6 +2498,22 @@ server <- function(input, output, session) {
       df <- df %>% filter(instrument == input$filter_instrument_scales)
     }
     
+    if (!is.null(input$search_scales) && nzchar(input$search_scales)) {
+      q <- tolower(input$search_scales)
+      
+      df <- df %>%
+        filter(
+          grepl(q, tolower(scale), fixed = TRUE) |
+            grepl(q, tolower(scale_varname), fixed = TRUE) |
+            grepl(q, tolower(scale_id), fixed = TRUE) |
+            grepl(q, tolower(study), fixed = TRUE) |
+            grepl(q, tolower(year), fixed = TRUE) |
+            grepl(q, tolower(cycle), fixed = TRUE) |
+            grepl(q, tolower(population), fixed = TRUE) |
+            grepl(q, tolower(instrument), fixed = TRUE)
+        )
+    }
+    
     df
   })
   
@@ -1542,6 +2541,7 @@ server <- function(input, output, session) {
     updateSelectInput(session, "filter_cycle_scales", selected = "All")
     updateSelectInput(session, "filter_population_scales", selected = "All")
     updateSelectInput(session, "filter_instrument_scales", selected = "All")
+    updateTextInput(session, "search_scales", value = "")
   })
   
   observe({
@@ -1565,9 +2565,14 @@ server <- function(input, output, session) {
               population == scale_row$population,
               instrument == scale_row$instrument,
               scale_id == scale_row$scale_id
-            )
+            ) %>%
+            distinct(item_uid, .keep_all = TRUE)
           
           add_items_to_cart(selected_items)
+        }, ignoreInit = TRUE)
+        
+        observeEvent(input[[paste0("details_scale_", scale_uid_safe)]], {
+          show_scale_details_modal(scale_row, items_data())
         }, ignoreInit = TRUE)
       })
     })
@@ -1629,6 +2634,20 @@ server <- function(input, output, session) {
       df <- df %>% filter(instrument == input$filter_instrument_questionnaires)
     }
     
+    if (!is.null(input$search_questionnaires) && nzchar(input$search_questionnaires)) {
+      q <- tolower(input$search_questionnaires)
+      
+      df <- df %>%
+        filter(
+          grepl(q, tolower(study), fixed = TRUE) |
+            grepl(q, tolower(year), fixed = TRUE) |
+            grepl(q, tolower(cycle), fixed = TRUE) |
+            grepl(q, tolower(population), fixed = TRUE) |
+            grepl(q, tolower(instrument), fixed = TRUE) |
+            grepl(q, tolower(questionnaire_uid), fixed = TRUE)
+        )
+    }
+    
     df
   })
   
@@ -1656,6 +2675,7 @@ server <- function(input, output, session) {
     updateSelectInput(session, "filter_cycle_questionnaires", selected = "All")
     updateSelectInput(session, "filter_population_questionnaires", selected = "All")
     updateSelectInput(session, "filter_instrument_questionnaires", selected = "All")
+    updateTextInput(session, "search_questionnaires", value = "")
   })
   
   observe({
@@ -1682,9 +2702,14 @@ server <- function(input, output, session) {
               cycle == questionnaire_row$cycle,
               population == questionnaire_row$population,
               instrument == questionnaire_row$instrument
-            )
+            ) %>%
+            distinct(item_uid, .keep_all = TRUE)
           
           add_items_to_cart(selected_items)
+        }, ignoreInit = TRUE)
+        
+        observeEvent(input[[paste0("details_questionnaire_", questionnaire_uid_safe)]], {
+          show_questionnaire_details_modal(questionnaire_row, items_data())
         }, ignoreInit = TRUE)
       })
     })
@@ -1709,7 +2734,7 @@ server <- function(input, output, session) {
     
     if (nrow(df) == 0) {
       return(
-        datatable(
+        datatable_cart(
           tibble(
             item_code = character(),
             wording = character(),
@@ -1719,9 +2744,7 @@ server <- function(input, output, session) {
             population = character(),
             instrument = character(),
             scale = character()
-          ),
-          rownames = FALSE,
-          options = list(pageLength = 10, scrollX = TRUE)
+          )
         )
       )
     }
@@ -1743,13 +2766,7 @@ server <- function(input, output, session) {
         dataset_label,
         puf
       ) %>%
-      datatable(
-        rownames = FALSE,
-        options = list(
-          pageLength = 10,
-          scrollX = TRUE
-        )
-      )
+      datatable_cart()
   })
   
   observeEvent(input$clear_cart, {
